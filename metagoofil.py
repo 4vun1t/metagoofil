@@ -2,6 +2,7 @@
 
 # Standard Python libraries.
 import argparse
+import base64
 import os
 import queue
 import random
@@ -12,10 +13,9 @@ import urllib
 
 
 # Third party Python libraries.
-# google == 2.0.1, module author changed import name to googlesearch
-# https://github.com/MarioVilas/googlesearch/commit/92309f4f23a6334a83c045f7c51f87b904e7d61d
 import googlesearch
 import requests
+from bs4 import BeautifulSoup
 
 # https://stackoverflow.com/questions/27981545/suppress-insecurerequestwarning-unverified-https-request-is-being-made-in-pytho
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -23,39 +23,35 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 
 class DownloadWorker(threading.Thread):
-    def __init__(self):
+    def __init__(self, metagoofil):
         threading.Thread.__init__(self)
+        self.mg = metagoofil
 
     def run(self):
         while True:
-            # Grab URL off the queue.
-            url = mg.queue.get()
+            url = self.mg.queue.get()
 
             try:
                 headers = {}
 
-                # Assign a User-Agent for each file request.
-                # No -u
-                if mg.user_agent is None:
-                    user_agent_choice = random.choice(mg.random_user_agents).strip()
+                if self.mg.user_agent is None:
+                    user_agent_choice = random.choice(self.mg.random_user_agents).strip()
                     headers["User-Agent"] = f"{user_agent_choice}"
-                # -u "My custom user agent 2.0"
                 else:
-                    headers["User-Agent"] = mg.user_agent
+                    headers["User-Agent"] = self.mg.user_agent
 
                 response = requests.get(
                     url,
                     headers=headers,
                     verify=False,
-                    timeout=mg.url_timeout,
+                    timeout=self.mg.url_timeout,
                     stream=True,
                 )
 
-                # Download the file.
                 if response.status_code == 200:
                     try:
                         size = int(response.headers["Content-Length"])
@@ -67,21 +63,16 @@ class DownloadWorker(threading.Thread):
                         )
                         size = len(response.content)
 
-                    mg.total_bytes += size
+                    self.mg.total_bytes += size
 
-                    # Strip any trailing /'s before extracting file name. Use response.url in case there were HTTP
-                    # 301/302 redirects.
                     url_file_name = str(response.url.strip("/").split("/")[-1])
-
-                    # Decode URL file name if it's encoded. No harm calling urllib.parse.unquote() if the URL file
-                    # name isn't URL encoded.
                     filename = urllib.parse.unquote(url_file_name, encoding="utf-8")
 
                     print(f'[+] Downloading "{filename}" [{size} bytes] from: {response.url}')
 
-                    with open(os.path.join(mg.save_directory, filename), "wb") as fh:
+                    with open(os.path.join(self.mg.save_directory, filename), "wb") as fh:
                         for chunk in response.iter_content(chunk_size=1024):
-                            if chunk:  # Filter out keep-alive new chunks.
+                            if chunk:
                                 fh.write(chunk)
 
                 else:
@@ -90,7 +81,7 @@ class DownloadWorker(threading.Thread):
             except requests.exceptions.RequestException as e:
                 print(f"[-] Exception for url: {url} -- {e}")
 
-            mg.queue.task_done()
+            self.mg.queue.task_done()
 
 
 class Metagoofil:
@@ -109,6 +100,8 @@ class Metagoofil:
         file_types,
         user_agent,
         download_files,
+        search_engines,
+        tor,
     ):
         self.domain = domain
         self.delay = delay
@@ -126,17 +119,21 @@ class Metagoofil:
 
         self.user_agent = user_agent
         # Populate a list of random User-Agents.
+        with open("user_agents.txt") as fp:
+            self.random_user_agents = fp.readlines()
         if self.user_agent is None:
-            with open("user_agents.txt") as fp:
-                self.random_user_agents = fp.readlines()
+            self.effective_ua = random.choice(self.random_user_agents).strip()
+        else:
+            self.effective_ua = self.user_agent
 
         self.download_files = download_files
         self.total_bytes = 0
+        self.search_engines = search_engines
+        self.tor = tor
 
     def go(self):
-        # Kickoff the threadpool.
         for i in range(self.number_of_threads):
-            thread = DownloadWorker()
+            thread = DownloadWorker(self)
             thread.daemon = True
             thread.start()
 
@@ -151,42 +148,44 @@ class Metagoofil:
             # Stores URLs with files, clear out for each filetype.
             self.files = []
 
-            # Search for the files to download.
-            print(
-                f"[*] Searching for {self.search_max} .{filetype} files and waiting {self.delay} seconds between searches"
-            )
             query = f"filetype:{filetype} site:{self.domain}"
 
-            try:
-                for url in googlesearch.search(
-                    query,
-                    start=0,
-                    stop=self.search_max,
-                    num=100,
-                    pause=self.delay,
-                    extra_params={"filter": "0"},
-                    user_agent=self.user_agent,
-                ):
-                    self.files.append(url)
+            # Search across selected engines
+            for engine in self.search_engines:
+                print(
+                    f"[*] Searching {engine} for {self.search_max} .{filetype} files "
+                    f"and waiting {self.delay} seconds between searches"
+                )
 
-            except Exception as e:
-                print(f"[-] EXCEPTION: {e}")
-                if e.code == 429:
-                    print(
-                        "[*] Google is blocking you for making too many requests. You will need to spread out the "
-                        "Google searches with metagoofil's switches or utilize SSH and dynamic SOCKS proxies. Don't "
-                        "know how to utilize SSH and dynamic SOCKS proxies?  Do yourself a favor and pick up a copy of "
-                        "The Cyber Plumber's Handbook and interactive lab (https://gumroad.com/l/cph_book_and_lab) to "
-                        "learn all about Secure Shell (SSH) tunneling, port redirection, and bending traffic like a "
-                        "boss."
-                    )
-                    print("[*] Exiting for now...")
-                    sys.exit(1)
+                try:
+                    if engine == "google":
+                        urls = search_google(query, self.search_max, self.delay, self.effective_ua, self.tor)
+                    elif engine == "duckduckgo":
+                        urls = search_duckduckgo(query, self.search_max, self.delay, self.effective_ua, self.tor)
+                    elif engine == "startpage":
+                        urls = search_startpage(query, self.search_max, self.delay, self.effective_ua, self.tor)
+                    elif engine == "searxng":
+                        urls = search_searxng(query, self.search_max, self.delay, self.effective_ua, self.tor)
+                    elif engine == "metager":
+                        urls = search_metager(query, self.search_max, self.delay, self.effective_ua, self.tor)
+                    elif engine == "mojeek":
+                        urls = search_mojeek(query, self.search_max, self.delay, self.effective_ua, self.tor)
+                    else:
+                        print(f"[-] Unknown search engine: {engine}")
+                        continue
 
-            # Since googlesearch.search method retrieves URLs in batches of 100, ensure the file list only contains the
-            # requested amount.
+                    self.files.extend(urls)
+                    print(f"[*] {engine} returned {len(urls)} results")
+
+                except Exception as e:
+                    print(f"[-] {engine} EXCEPTION: {e}")
+
+            # Deduplicate while preserving order.
+            self.files = list(dict.fromkeys(self.files))
+
+            # Ensure the file list only contains the requested amount.
             if len(self.files) > self.search_max:
-                self.files = self.files[: -(len(self.files) - self.search_max)]
+                self.files = self.files[:self.search_max]
 
             # Download files if specified with -w switch.
             if self.download_files:
@@ -221,6 +220,396 @@ class Metagoofil:
                 self.counter += 1
 
         self.queue.join()
+
+
+# ---- Search engine implementations ----
+
+
+def search_google(query, stop, pause, user_agent, tor=False):
+    urls = []
+    proxies = _get_tor_proxies(tor)
+    if proxies:
+        headers = {"User-Agent": user_agent}
+        start = 0
+        while len(urls) < stop:
+            params = {"q": query, "start": start, "num": 100, "filter": "0"}
+            try:
+                resp = requests.get(
+                    "https://www.google.com/search",
+                    params=params,
+                    headers=headers,
+                    proxies=proxies,
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    break
+                soup = BeautifulSoup(resp.text, "html.parser")
+                before = len(urls)
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if href.startswith("/url?q="):
+                        parsed = urllib.parse.urlparse(href)
+                        qs = urllib.parse.parse_qs(parsed.query)
+                        actual = qs.get("q", [None])[0]
+                        if actual and actual.startswith("http") and actual not in urls:
+                            urls.append(actual)
+                    elif href.startswith("http") and "google.com" not in href:
+                        if href not in urls:
+                            urls.append(href)
+                    if len(urls) >= stop:
+                        break
+                if len(urls) == before:
+                    break
+                start += 100
+                time.sleep(pause)
+            except requests.exceptions.RequestException as e:
+                print(f"[-] Google request error: {e}")
+                break
+    else:
+        try:
+            for url in googlesearch.search(
+                query,
+                start=0,
+                stop=stop,
+                num=100,
+                pause=pause,
+                extra_params={"filter": "0"},
+                user_agent=user_agent,
+            ):
+                urls.append(url)
+        except Exception as e:
+            print(f"[-] Google EXCEPTION: {e}")
+    return urls
+
+
+SEARXNG_INSTANCES = [
+    os.environ.get("SEARXNG_INSTANCE", "https://searx.be"),
+    "https://search.sapti.me",
+    "https://priv.au",
+    "https://searx.perennialte.ch",
+    "https://searx.work",
+]
+
+
+def search_searxng(query, stop, pause, user_agent, tor=False):
+    headers = {"User-Agent": user_agent}
+    urls = []
+    proxies = _get_tor_proxies(tor)
+
+    for instance in SEARXNG_INSTANCES:
+        if len(urls) >= stop:
+            break
+        params = {"q": query, "format": "html"}
+        print(f"[*]   Using SearXNG instance: {instance}")
+        try:
+            resp = requests.get(
+                f"{instance}/search",
+                params=params,
+                headers=headers,
+                proxies=proxies,
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for article in soup.select("article.result"):
+                a = article.select_one("h3 a")
+                if not a:
+                    a = article.select_one("a.url_header")
+                if not a:
+                    continue
+                href = a.get("href")
+                if href and href.startswith("http") and href not in urls:
+                    urls.append(href)
+                    if len(urls) >= stop:
+                        break
+
+            if urls:
+                break
+
+        except requests.exceptions.RequestException as e:
+            print(f"[-] SearXNG ({instance}) request error: {e}")
+            continue
+
+    return urls
+
+
+def search_metager(query, stop, pause, user_agent, tor=False):
+    headers = {"User-Agent": user_agent}
+    urls = []
+    proxies = _get_tor_proxies(tor)
+    offset = 0
+
+    while len(urls) < stop:
+        params = {"q": query, "offset": offset}
+        try:
+            resp = requests.get(
+                "https://metager.org/meta/meta.ger3",
+                params=params,
+                headers=headers,
+                proxies=proxies,
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                break
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            links = soup.select("h3.result-title a")
+
+            if not links:
+                break
+
+            before = len(urls)
+            for a in links:
+                href = a.get("href")
+                if href and href.startswith("http") and href not in urls:
+                    urls.append(href)
+                    if len(urls) >= stop:
+                        break
+
+            if len(urls) == before:
+                break
+
+            offset += 10
+            time.sleep(pause)
+
+        except requests.exceptions.RequestException as e:
+            print(f"[-] MetaGer request error: {e}")
+            break
+
+    return urls
+
+
+def search_mojeek(query, stop, pause, user_agent, tor=False):
+    headers = {"User-Agent": user_agent}
+    urls = []
+    proxies = _get_tor_proxies(tor)
+    page = 1
+
+    while len(urls) < stop:
+        params = {"q": query, "s": page}
+        try:
+            resp = requests.get(
+                "https://www.mojeek.com/search",
+                params=params,
+                headers=headers,
+                proxies=proxies,
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                break
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            links = soup.select("a.title, h2 a")
+
+            if not links:
+                break
+
+            before = len(urls)
+            for a in links:
+                href = a.get("href")
+                if href and href.startswith("http") and href not in urls:
+                    urls.append(href)
+                    if len(urls) >= stop:
+                        break
+
+            if len(urls) == before:
+                break
+
+            page += 1
+            time.sleep(pause)
+
+        except requests.exceptions.RequestException as e:
+            print(f"[-] Mojeek request error: {e}")
+            break
+
+    return urls
+
+
+_tor_cache = None
+
+
+def _get_tor_proxies(tor):
+    global _tor_cache
+    if _tor_cache is not None:
+        return _tor_cache if tor else None
+    if not tor:
+        _tor_cache = None
+        return None
+    try:
+        s = requests.Session()
+        s.proxies = {"http": "socks5h://127.0.0.1:9050", "https": "socks5h://127.0.0.1:9050"}
+        s.get("http://httpbin.org/ip", timeout=3)
+        _tor_cache = {"http": "socks5h://127.0.0.1:9050", "https": "socks5h://127.0.0.1:9050"}
+        return _tor_cache
+    except Exception:
+        _tor_cache = None
+        return None
+
+
+def search_duckduckgo(query, stop, pause, user_agent, tor=False):
+    headers = {"User-Agent": user_agent}
+    urls = []
+    tor_proxies = _get_tor_proxies(tor)
+
+    endpoints = []
+    if tor_proxies:
+        endpoints.append((
+            "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/html/",
+            tor_proxies,
+            "DuckDuckGo onion",
+        ))
+    endpoints.append((
+        "https://html.duckduckgo.com/html/",
+        tor_proxies,
+        "DuckDuckGo (via Tor)" if tor_proxies else "DuckDuckGo",
+    ))
+
+    for base_url, proxies, label in endpoints:
+        if len(urls) >= stop:
+            break
+        params = {"q": query}
+        print(f"[*]   Using {label}")
+        consecutive_empty = 0
+        while len(urls) < stop:
+            try:
+                resp = requests.get(
+                    base_url,
+                    params=params,
+                    headers=headers,
+                    proxies=proxies,
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    break
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+                links = soup.select("a.result__a")
+
+                if not links:
+                    break
+
+                before = len(urls)
+                for a in links:
+                    href = a.get("href")
+                    if href:
+                        parsed = urllib.parse.urlparse(href)
+                        qs = urllib.parse.parse_qs(parsed.query)
+                        actual = qs.get("uddg", [None])[0]
+                        if actual and actual not in urls:
+                            urls.append(actual)
+                            if len(urls) >= stop:
+                                break
+
+                if len(urls) == before:
+                    consecutive_empty += 1
+                    if consecutive_empty >= 3:
+                        break
+                else:
+                    consecutive_empty = 0
+
+                params["s"] = str(int(params.get("s", "0")) + 50)
+                if len(urls) > before:
+                    time.sleep(pause)
+
+            except requests.exceptions.RequestException as e:
+                print(f"[-] DuckDuckGo ({label}) request error: {e}")
+                break
+
+    return urls
+
+
+def search_startpage(query, stop, pause, user_agent, tor=False):
+    headers = {"User-Agent": user_agent}
+    urls = []
+    tor_proxies = _get_tor_proxies(tor)
+
+    endpoints = []
+    if tor_proxies:
+        endpoints.append((
+            "http://startpagel6srwcjlue4zgq3zevrujfaow726kjytqbbjyrswwmjzcqd.onion/sp/search",
+            tor_proxies,
+            "Startpage onion",
+        ))
+    endpoints.append((
+        "https://www.startpage.com/sp/search",
+        tor_proxies,
+        "Startpage (via Tor)" if tor_proxies else "Startpage",
+    ))
+
+    skip_domains = {"startpage.com", "startmail.com", "twitter.com", "reddit.com",
+                     "instagram.com", "facebook.com", "mastodon.social"}
+
+    for base_url, proxies, label in endpoints:
+        if len(urls) >= stop:
+            break
+        params = {"q": query}
+        print(f"[*]   Using {label}")
+        consecutive_empty = 0
+        while len(urls) < stop:
+            try:
+                resp = requests.get(
+                    base_url,
+                    params=params,
+                    headers=headers,
+                    proxies=proxies,
+                    timeout=30,
+                )
+                if resp.status_code != 200:
+                    break
+
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                links = (
+                    soup.select("a.result-title")
+                    or soup.select(".search-item__title a")
+                    or soup.select("a.wgl-link")
+                    or [a for a in soup.find_all("a", href=True)
+                        if "/sp/view?" in a["href"]]
+                )
+
+                if not links:
+                    break
+
+                before = len(urls)
+                for a in links:
+                    href = a.get("href")
+                    if not href:
+                        continue
+                    if "/sp/view?" in href:
+                        parsed = urllib.parse.urlparse(href)
+                        qs = urllib.parse.parse_qs(parsed.query)
+                        actual = qs.get("url", [None])[0]
+                        if actual:
+                            href = actual
+                    if href.startswith("http"):
+                        domain = urllib.parse.urlparse(href).netloc.lower()
+                        if domain in skip_domains or any(d in domain for d in skip_domains):
+                            continue
+                        if domain.endswith(".onion"):
+                            continue
+                        if href not in urls:
+                            urls.append(href)
+                            if len(urls) >= stop:
+                                break
+
+                if len(urls) == before:
+                    consecutive_empty += 1
+                    if consecutive_empty >= 3:
+                        break
+                else:
+                    consecutive_empty = 0
+
+                params["page"] = str(int(params.get("page", "1")) + 1)
+                if len(urls) > before:
+                    time.sleep(pause)
+
+            except requests.exceptions.RequestException as e:
+                print(f"[-] Startpage ({label}) request error: {e}")
+                break
+
+    return urls
 
 
 def get_timestamp():
@@ -260,9 +649,9 @@ def positive_float(value):
         raise argparse.ArgumentTypeError(f"invalid value '{value}', must be a float >= 0")
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
-        description=f"Metagoofil v{__version__} - Search Google and download specific file types.",
+        description=f"Metagoofil v{__version__} - Search Google, DuckDuckGo, Startpage, SearXNG, MetaGer, and Mojeek and download specific file types.",
         formatter_class=SmartFormatter,
     )
     parser.add_argument(
@@ -335,6 +724,14 @@ if __name__ == "__main__":
         help="Number of downloader threads. Default: 8",
     )
     parser.add_argument(
+        "-s",
+        dest="search_engines",
+        action="store",
+        type=csv_list,
+        default=["google", "duckduckgo", "startpage", "searxng", "metager", "mojeek"],
+        help="Comma-separated search engines: google,duckduckgo,startpage,searxng,metager,mojeek (default: all)",
+    )
+    parser.add_argument(
         "-t",
         dest="file_types",
         action="store",
@@ -350,7 +747,7 @@ if __name__ == "__main__":
         dest="user_agent",
         nargs="?",
         default=None,
-        help="R|User-Agent for googlesearch and file retrieval against -d domain.\n"
+        help="R|User-Agent for search engines and file retrieval against -d domain.\n"
         "no -u = Randomize User-Agent (recommended)\n"
         '-u "My custom user agent 2.0" = Your customized User-Agent',
     )
@@ -361,7 +758,21 @@ if __name__ == "__main__":
         default=False,
         help="Download the files, instead of just viewing search results.",
     )
+    parser.add_argument(
+        "--tor",
+        dest="tor",
+        action="store_true",
+        default=False,
+        help="Route all search engine requests through Tor SOCKS proxy (127.0.0.1:9050). Also enables onion service endpoints for DuckDuckGo and Startpage.",
+    )
     args = parser.parse_args()
+
+    # Validate search engines
+    valid_engines = {"google", "duckduckgo", "startpage", "searxng", "metager", "mojeek"}
+    for e in args.search_engines:
+        if e not in valid_engines:
+            print(f"[-] Invalid search engine '{e}'. Valid options: {', '.join(sorted(valid_engines))}")
+            sys.exit(1)
 
     if args.save_directory and args.download_files:
         print(f"[*] Downloaded files will be saved here: {args.save_directory}")
@@ -379,3 +790,7 @@ if __name__ == "__main__":
     mg.go()
 
     print("[+] Done!")
+
+
+if __name__ == "__main__":
+    main()
