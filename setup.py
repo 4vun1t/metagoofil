@@ -2,7 +2,7 @@
 
 from setuptools import setup
 
-__version__ = "1.5.0"
+__version__ = "2.0.1"
 
 with open("README.md") as fh:
     long_description = fh.read()
@@ -16,8 +16,8 @@ setup(
     description="Metagoofil - Search Google, DuckDuckGo, Startpage, SearXNG, MetaGer, and Mojeek and download specific file types.",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    author="opsdisk",
-    url="https://github.com/opsdisk/metagoofil",
+    author="4vun1t",
+    url="https://github.com/4vun1t/metagoofil",
     license="GPLv3",
     python_requires=">=3.8",
     install_requires=requirements,
